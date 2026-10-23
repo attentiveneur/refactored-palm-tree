@@ -1,0 +1,361 @@
+name: Build IPA v26
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: 1 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 2 环境
+        run: |
+          set -e
+          xcodebuild -version
+          sw_vers
+          echo "---- 仓库根目录 ----"
+          ls -la
+
+      # ============================================================
+      # 3 找源码：只认 v26（zip 优先，其次文件夹）
+      # ============================================================
+      - name: 3 定位 v26 源码
+        id: locate
+        run: |
+          set -eu
+          echo "==== 只认 v26，别的一概不碰 ===="
+          BEST=""
+
+          for z in $(ls -1 *.zip 2>/dev/null | grep -iE 'v26\.[0-9]+' | sort -rV || true); do
+            [ -f "$z" ] || continue
+            echo "---- 试包：$z ----"
+            rm -rf _src
+            mkdir -p _src
+            if python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$z" _src 2>/dev/null; then
+              echo "解压：python zipfile OK"
+            else
+              unzip -oq "$z" -d _src || { echo "跳过：不是有效压缩包"; rm -rf _src; continue; }
+              echo "解压：unzip OK"
+            fi
+            P=$(find _src -maxdepth 5 -name project.pbxproj -path '*ThreeOneOSFive.xcodeproj*' | head -n 1 || true)
+            if [ -z "${P:-}" ]; then echo "跳过：包里没有 Xcode 工程"; rm -rf _src; continue; fi
+            D=$(cd "$(dirname "$P")/.." && pwd)
+            if grep -q 'MARKETING_VERSION = 26\.0' "$P"; then
+              BEST="$D"; echo "命中压缩包：$z → $D"; break
+            fi
+            echo "跳过：不是 v26.0"; rm -rf _src
+          done
+
+          if [ -z "$BEST" ]; then
+            for d in $(ls -1d LSPakManager-Source-v26.0*/ 2>/dev/null | sed 's:/$::' | sort -rV || true); do
+              if [ -f "$d/ThreeOneOSFive.xcodeproj/project.pbxproj" ] && grep -q 'MARKETING_VERSION = 26\.0' "$d/ThreeOneOSFive.xcodeproj/project.pbxproj"; then
+                BEST="$d"; echo "命中文件夹：$d"; break
+              fi
+            done
+          fi
+
+          if [ -z "$BEST" ]; then
+            echo "::error::仓库里没找到 v26.0 源码"
+            {
+              echo "## ⛔ 没找到 v26.0 源码"
+              echo ""
+              echo "把 \`LSPakManager-Source-v26.0.zip\` 原样传到仓库根目录（别解压、别改名），再点 Run workflow。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            ls -la *.zip 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "SRC=$BEST" >> "$GITHUB_OUTPUT"
+          echo "======================================"
+          echo "选中源码 = $BEST"
+          echo "======================================"
+          ls -la "$BEST" | head -30
+
+      # ============================================================
+      # 4 硬校验：清单里缺一项就中止，别浪费时间编译
+      # ============================================================
+      - name: 4 源码硬校验
+        run: |
+          set -eu
+          SRC="${{ steps.locate.outputs.SRC }}"
+          APP="$SRC/ThreeOneOSFive"
+          PBX="$SRC/ThreeOneOSFive.xcodeproj/project.pbxproj"
+          PLIST="$APP/Info.plist"
+          FAIL=0
+          chk() { if [ "$1" = "1" ]; then echo "  ✅ $2"; else echo "  ❌ $2"; FAIL=1; fi; }
+
+          echo "==== 4.1 版本与标识 ===="
+          grep -q 'MARKETING_VERSION = 26\.0' "$PBX" && chk 1 "版本 26.0" || chk 0 "版本 26.0"
+          grep -q 'CURRENT_PROJECT_VERSION = 94' "$PBX" && chk 1 "构建号 94" || chk 0 "构建号 94"
+          grep -qE 'PRODUCT_BUNDLE_IDENTIFIER = "?com\.apple\.mobile\.MobileHouseArrest"?' "$PBX" \
+            && chk 1 "包标识 com.apple.mobile.MobileHouseArrest" || chk 0 "包标识"
+          grep -q '<string>浪神</string>' "$PLIST" && chk 1 "显示名 浪神" || chk 0 "显示名 浪神"
+          grep -q 'CFBundleShortVersionString' "$PLIST" && chk 1 "Info.plist 有版本键" || chk 0 "Info.plist 有版本键"
+
+          echo "==== 4.2 启动视频 ===="
+          [ -f "$APP/splash.mp4" ] && chk 1 "splash.mp4 在包内" || chk 0 "splash.mp4 在包内"
+          SZ=$(wc -c < "$APP/splash.mp4" 2>/dev/null | tr -d ' ' || echo 0)
+          [ "$SZ" -gt 1000000 ] && chk 1 "视频体积 $((SZ/1024/1024))MB" || chk 0 "视频体积异常 ${SZ}B"
+          grep -q 'splash.mp4 in Resources' "$PBX" && chk 1 "视频已加入 Resources" || chk 0 "视频已加入 Resources"
+          [ -f "$APP/Assets.xcassets/LaunchBg.colorset/Contents.json" ] && chk 1 "启动底色 LaunchBg" || chk 0 "启动底色 LaunchBg"
+
+          echo "==== 4.3 卡密门 ===="
+          [ -f "$APP/helpers/SplashLicenseGate.swift" ] && chk 1 "SplashLicenseGate.swift" || chk 0 "SplashLicenseGate.swift"
+          [ -f "$APP/helpers/LicenseManager.swift" ] && chk 1 "LicenseManager.swift" || chk 0 "LicenseManager.swift"
+          grep -q 'SplashLicenseGate.swift in Sources' "$PBX" && chk 1 "卡密门已加入 Sources" || chk 0 "卡密门已加入 Sources"
+          grep -q 'LicenseManager.swift in Sources' "$PBX" && chk 1 "验证器已加入 Sources" || chk 0 "验证器已加入 Sources"
+          grep -q 'struct SplashLicenseGateView' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "卡密页 View 存在" || chk 0 "卡密页 View 存在"
+          grep -q 'struct SplashVideoBackground' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "视频背景视图存在" || chk 0 "视频背景视图存在"
+          for t in 授权验证 立即验证 卡密可在官方渠道获取; do
+            if grep -q "$t" "$APP/helpers/LicenseTheme.swift" || grep -q "$t" "$APP/helpers/SplashLicenseGate.swift"; then
+              chk 1 "文案：$t"
+            else
+              chk 0 "文案：$t"
+            fi
+          done
+
+          echo "==== 4.4 验证接口与记住登录 ===="
+          grep -q 'https://ek.x8iu.com/api/verify.php' "$APP/helpers/LicenseManager.swift" \
+            && chk 1 "接口 https://ek.x8iu.com/api/verify.php" || chk 0 "验证接口地址"
+          grep -q 'kSecClassGenericPassword' "$APP/helpers/LicenseManager.swift" \
+            && chk 1 "卡密存钥匙串（下次免输）" || chk 0 "钥匙串存储"
+          grep -q 'func refreshOnLaunch' "$APP/helpers/LicenseManager.swift" \
+            && chk 1 "启动时复查到期" || chk 0 "启动复查"
+          grep -q 'isUnlocked' "$APP/helpers/LicenseManager.swift" && chk 1 "解锁状态判断" || chk 0 "解锁状态判断"
+
+          echo "==== 4.5 首页与工具箱 ===="
+          grep -q 'struct RootGateView' "$APP/ContentView.swift" && chk 1 "RootGateView 门控" || chk 0 "RootGateView 门控"
+          grep -q 'SimpleHomeView' "$APP/ContentView.swift" && chk 1 "首页 SimpleHomeView" || chk 0 "首页 SimpleHomeView"
+          grep -q 'splashDone' "$APP/ContentView.swift" && chk 1 "播完视频才进门控" || chk 0 "播完视频才进门控"
+          if grep -rq '一键新机' "$APP" --include=*.swift; then chk 0 "已删干净 '一键新机'"; else chk 1 "已删干净 '一键新机'"; fi
+
+          echo "==== 4.5b v26 · 壁纸背景 ===="
+          [ -f "$APP/Assets.xcassets/HomeBg.imageset/HomeBg.jpg" ] && chk 1 "壁纸 HomeBg.jpg 在包内" || chk 0 "壁纸 HomeBg.jpg 在包内"
+          [ -f "$APP/Assets.xcassets/HomeBg.imageset/Contents.json" ] && chk 1 "壁纸 Contents.json 在" || chk 0 "壁纸 Contents.json 在"
+          BGSZ=$(wc -c < "$APP/Assets.xcassets/HomeBg.imageset/HomeBg.jpg" 2>/dev/null | tr -d ' ' || echo 0)
+          [ "$BGSZ" -gt 60000 ] && chk 1 "壁纸体积 $(($BGSZ/1024))KB" || chk 0 "壁纸体积异常 ${BGSZ}B"
+          grep -q '"HomeBg"' "$APP/ContentView.swift" && chk 1 "首页已铺壁纸" || chk 0 "首页已铺壁纸"
+          grep -q 'struct HomeBackdrop' "$APP/ContentView.swift" && chk 1 "HomeBackdrop 背景层" || chk 0 "HomeBackdrop 背景层"
+          grep -q '0.38, green: 0.88, blue: 1.00' "$APP/ContentView.swift" && chk 1 "冷蓝青主色" || chk 0 "冷蓝青主色"
+
+          echo "==== 4.5c v26 · 注入 / 修复 ===="
+          grep -q 'bigButton(title: "注入"' "$APP/ContentView.swift" && chk 1 "按钮：注入" || chk 0 "按钮：注入"
+          grep -q 'bigButton(title: "修复"' "$APP/ContentView.swift" && chk 1 "按钮：修复" || chk 0 "按钮：修复"
+          if grep -q 'bigButton(title: "一键导入"' "$APP/ContentView.swift"; then chk 0 "旧按钮文案已清"; else chk 1 "旧按钮文案已清"; fi
+          grep -q 'PAK 注入 / 修复' "$APP/ContentView.swift" && chk 1 "副标题 PAK 注入 / 修复" || chk 0 "副标题 PAK 注入 / 修复"
+
+          echo "==== 4.5d v26 · 手机 + iPad 双适配 ===="
+          grep -q 'let wide = geo.size.width >= 700' "$APP/ContentView.swift" && chk 1 "自适应宽度（手机/iPad 同一套）" || chk 0 "自适应宽度"
+          grep -q 'frame(maxWidth: contentMax)' "$APP/ContentView.swift" && chk 1 "iPad 收成一列居中" || chk 0 "iPad 收窄"
+          grep -q 'TARGETED_DEVICE_FAMILY = "1,2"' "$PBX" && chk 1 "工程支持 iPhone + iPad" || chk 0 "工程支持 iPhone + iPad"
+
+          echo "==== 4.5e v26 · 防封改版 ===="
+          grep -q 'private func fireGuard' "$APP/ContentView.swift" && chk 1 "fireGuard 点击执行" || chk 0 "fireGuard 点击执行"
+          grep -q 'private var guardRecordsBlock' "$APP/ContentView.swift" && chk 1 "运行记录改成页内" || chk 0 "运行记录页内"
+          if grep -q 'guardPopupOn' "$APP/ContentView.swift"; then chk 0 "旧弹窗已清掉"; else chk 1 "旧弹窗已清掉"; fi
+          if grep -q 'struct GuardRunPopup' "$APP/ContentView.swift"; then chk 0 "旧弹窗结构已删"; else chk 1 "旧弹窗结构已删"; fi
+          grep -q 'guardExpanded.toggle()' "$APP/ContentView.swift" && chk 1 "运行记录展开图标" || chk 0 "运行记录展开图标"
+          grep -q '开启防封' "$APP/ContentView.swift" && chk 1 "按钮：开启防封" || chk 0 "按钮：开启防封"
+          grep -q 'toolboxExpanded.toggle()' "$APP/ContentView.swift" && chk 1 "工具箱展开按钮" || chk 0 "工具箱展开按钮"
+          grep -q '封包混淆已激活' "$APP/ContentView.swift" && chk 1 "记录含：封包混淆已激活" || chk 0 "记录含：封包混淆已激活"
+          grep -q '心跳包时序重排' "$APP/ContentView.swift" && chk 1 "记录含：心跳包时序重排" || chk 0 "记录含：心跳包时序重排"
+          grep -q '云端规则同步' "$APP/ContentView.swift" && chk 1 "记录含：云端规则同步" || chk 0 "记录含：云端规则同步"
+
+          echo "==== 4.5f v26 · 进入游戏 / 到期时间 / 续费 ===="
+          grep -q 'enum GameLauncher' "$APP/ContentView.swift" && chk 1 "进入游戏 GameLauncher" || chk 0 "进入游戏 GameLauncher"
+          grep -q 'openApplicationForBundleID(bid)' "$APP/ContentView.swift" && chk 1 "点一下跳本地游戏" || chk 0 "点一下跳本地游戏"
+          grep -q 'Text("进入游戏")' "$APP/ContentView.swift" && chk 1 "按钮：进入游戏" || chk 0 "按钮：进入游戏"
+          grep -q 'private var expiryBar' "$APP/ContentView.swift" && chk 1 "首页显示到期时间" || chk 0 "首页显示到期时间"
+          grep -q 'var remainingDays' "$APP/helpers/LicenseManager.swift" && chk 1 "剩余天数计算" || chk 0 "剩余天数计算"
+          grep -q 'func renew(code' "$APP/helpers/LicenseManager.swift" && chk 1 "续费接口 renew" || chk 0 "续费接口 renew"
+          grep -q '立即续费' "$APP/ContentView.swift" && chk 1 "按钮：立即续费" || chk 0 "按钮：立即续费"
+          grep -q '"注入成功"' "$APP/ContentView.swift" && chk 1 "弹窗：注入成功" || chk 0 "弹窗：注入成功"
+          grep -q '"注入失败"' "$APP/ContentView.swift" && chk 1 "弹窗：注入失败" || chk 0 "弹窗：注入失败"
+          grep -q '"修复成功"' "$APP/ContentView.swift" && chk 1 "弹窗：修复成功" || chk 0 "弹窗：修复成功"
+          grep -q '"修复失败"' "$APP/ContentView.swift" && chk 1 "弹窗：修复失败" || chk 0 "弹窗：修复失败"
+
+          echo "==== 4.5g v26 · 真满屏覆盖（手机 / 平板）===="
+          [ -f "$APP/Assets.xcassets/HomeBgWide.imageset/HomeBgWide.jpg" ] && chk 1 "横版壁纸在包内" || chk 0 "横版壁纸在包内"
+          [ -f "$APP/Assets.xcassets/HomeBgWide.imageset/Contents.json" ] && chk 1 "横版壁纸 Contents.json 在" || chk 0 "横版壁纸 Contents.json 在"
+          WIDE=$(wc -c < "$APP/Assets.xcassets/HomeBgWide.imageset/HomeBgWide.jpg" 2>/dev/null | tr -d ' ' || echo 0)
+          [ "$WIDE" -gt 100000 ] && chk 1 "横版壁纸体积 $(($WIDE/1024))KB" || chk 0 "横版壁纸体积异常 ${WIDE}B"
+          grep -q 'Image(wideAsset ? "HomeBgWide" : "HomeBg")' "$APP/ContentView.swift" \
+            && chk 1 "壁纸按屏幕比例换竖版/横版" || chk 0 "壁纸按屏幕比例换版"
+          if grep -q 'aspectRatio(contentMode: wideFrame ? .fit : .fill)' "$APP/ContentView.swift"; then
+            chk 0 "首页已不再居中留边"
+          else
+            chk 1 "首页已不再居中留边"
+          fi
+          if grep -q 'blur(radius: 38, opaque: true)' "$APP/ContentView.swift"; then chk 0 "首页已不再模糊垫底"; else chk 1 "首页已不再模糊垫底"; fi
+          if grep -q 'aspectRatio(contentMode: wideFrame ? .fit : .fill)' "$APP/helpers/SplashLicenseGate.swift"; then chk 0 "卡密背景图已不再居中留边"; else chk 1 "卡密背景图已不再居中留边"; fi
+          if grep -rq 'backdropImage' "$APP"; then chk 0 "视频已不再模糊垫底"; else chk 1 "视频已不再模糊垫底"; fi
+          [ -f "$APP/splashWide.mp4" ] && chk 1 "横版启动片在包内" || chk 0 "横版启动片在包内"
+          WSZ=$(wc -c < "$APP/splashWide.mp4" 2>/dev/null | tr -d ' ' || echo 0)
+          [ "$WSZ" -gt 500000 ] && chk 1 "横版启动片体积 $(($WSZ/1024))KB" || chk 0 "横版启动片体积异常 ${WSZ}B"
+          grep -q 'splashWide.mp4 in Resources' "$PBX" && chk 1 "横版启动片已加入 Resources" || chk 0 "横版启动片已加入 Resources"
+          grep -q 'playerLayer.videoGravity = .resizeAspectFill' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "视频铺满裁边" || chk 0 "视频铺满裁边"
+          if grep -q 'resizeAspect :' "$APP/helpers/SplashLicenseGate.swift"; then chk 0 "旧的双模式已清"; else chk 1 "旧的双模式已清"; fi
+          grep -q 'forResource: "splashWide"' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "宽屏自动换横版启动片" || chk 0 "宽屏自动换横版启动片"
+          grep -q 'struct LSFillImage' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "后台自定义图满屏铺满" || chk 0 "后台自定义图满屏铺满"
+          grep -q 'let columnMax: CGFloat = wide ? 480 : .infinity' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "卡密页 iPad 收窄居中" || chk 0 "卡密页 iPad 收窄居中"
+          grep -q 'SplashVideoBackground(onFinished: { finishVideo() })' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "启动视频仍在门控里" || chk 0 "启动视频仍在门控里"
+
+          echo "==== 4.5h v26 · 卡密窗口在线换装 ===="
+          [ -f "$APP/helpers/LicenseTheme.swift" ] && chk 1 "换装模块 LicenseTheme.swift 在" || chk 0 "换装模块 LicenseTheme.swift 在"
+          grep -q 'LicenseTheme.swift in Sources' "$PBX" && chk 1 "换装模块已加入 Sources" || chk 0 "换装模块已加入 Sources"
+          grep -q 'struct LicenseTheme' "$APP/helpers/LicenseTheme.swift" && chk 1 "主题数据结构在" || chk 0 "主题数据结构在"
+          grep -q 'final class LicenseThemeStore: ObservableObject' "$APP/helpers/LicenseTheme.swift" && chk 1 "主题拉取器在" || chk 0 "主题拉取器在"
+          grep -q 'api/license-theme.json' "$APP/helpers/LicenseTheme.swift" && chk 1 "接口指向 api/license-theme.json" || chk 0 "接口指向 api/license-theme.json"
+          grep -q 'await themeStore.refresh()' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "卡密页进来会拉最新样式" || chk 0 "卡密页进来会拉最新样式"
+          grep -q 'Text(th.title)' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "大标题走后台配置" || chk 0 "大标题走后台配置"
+          grep -q 'Text(license.isBusy ? "验证中…" : th.button)' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "按钮文字走后台配置" || chk 0 "按钮文字走后台配置"
+          grep -q 'LSThemeColor.color(th.primary' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "配色走后台配置" || chk 0 "配色走后台配置"
+          grep -q 'struct LSFillImage' "$APP/helpers/SplashLicenseGate.swift" && chk 1 "后台背景图满屏组件在" || chk 0 "后台背景图满屏组件在"
+          grep -q 'ls.theme.json' "$APP/helpers/LicenseTheme.swift" && chk 1 "断网回落本机缓存" || chk 0 "断网回落本机缓存"
+          grep -q '<string>26.0</string>' "$PLIST" && chk 1 "包版本 26.0" || chk 0 "包版本 26.0"
+          grep -q 'Text("v26.0")' "$APP/ContentView.swift" && chk 1 "界面右上角显示 v26.0" || chk 0 "界面右上角显示 v26.0"
+
+          echo "==== 4.6 工程完整性 ===="
+          N=$(ls -1 "$APP"/*.swift "$APP"/helpers/*.swift "$APP"/views/*.swift 2>/dev/null | wc -l | tr -d ' ')
+          [ "$N" -ge 40 ] && chk 1 "Swift 文件 $N 个" || chk 0 "Swift 文件只有 $N 个"
+          [ -f "$APP/Assets.xcassets/AppIcon.appiconset/Contents.json" ] && chk 1 "图标集在" || chk 0 "图标集在"
+
+          echo "======================================"
+          if [ "$FAIL" = "1" ]; then
+            {
+              echo "## ⛔ 源码校验没过，已停止编译"
+              echo ""
+              echo "看上面标 ❌ 的那几行，把源码包换成完整的 v26.0 再跑。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "源码校验全部通过 ✅"
+
+      # ============================================================
+      # 5 编译（不签名）
+      # ============================================================
+      - name: 5 编译（失败也把 error 摘出来）
+        run: |
+          set +e
+          SRC="${{ steps.locate.outputs.SRC }}"
+          cd "$SRC" || { echo "::error title=出错::进不去源码目录"; exit 1; }
+          echo "==== 开始编译 v26.0 ===="
+          xcodebuild \
+            -project ThreeOneOSFive.xcodeproj \
+            -scheme OGIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            build > /tmp/build.log 2>&1
+          RC=$?
+          echo "xcodebuild 退出码：$RC"
+
+          if [ "$RC" -eq 0 ]; then
+            echo "==== 编译成功 ===="
+            exit 0
+          fi
+
+          grep -E "error: " /tmp/build.log | sort -u | head -20 > /tmp/errs.txt
+          N=$(wc -l < /tmp/errs.txt | tr -d ' ')
+          echo "==== 抓到 $N 条 error 行 ===="
+
+          if [ "$N" -gt 0 ]; then
+            while IFS= read -r line; do
+              short=$(printf '%s' "$line" | sed -E 's#^.*/(ThreeOneOSFive|LSPakManager[^/]*)/##' | cut -c1-350)
+              echo "::error title=编译错误::$short"
+              echo "  🔴 $short"
+            done < /tmp/errs.txt
+          else
+            echo "::error title=编译失败::没抓到 error 行，看日志结尾 60 行"
+          fi
+
+          {
+            echo "## 🔴 v26.0 编译错误"
+            echo ""
+            echo '```'
+            cat /tmp/errs.txt
+            echo '```'
+            echo ""
+            echo "## 日志结尾 60 行"
+            echo '```'
+            tail -60 /tmp/build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          { echo "==== error 行 ===="; cat /tmp/errs.txt; echo; echo "==== 结尾 80 行 ===="; tail -80 /tmp/build.log; } > "$GITHUB_WORKSPACE/v26-编译错误.txt"
+
+          exit "$RC"
+
+      - name: 6 打未签名 ipa + 302 自查
+        run: |
+          set -eu
+          SRC="${{ steps.locate.outputs.SRC }}"
+          APP=$(find "$SRC/build/Build/Products/Release-iphoneos" -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "::error::没编出 .app"
+            grep -E "error:" /tmp/build.log | head -40 || true
+            exit 1
+          fi
+          echo "产物：$APP"
+          echo "---- app 里的关键文件 ----"
+          ls -la "$APP" | head -20
+          echo "---- 视频进包了吗 ----"
+          ls -la "$APP/splash.mp4" || { echo "::error::视频没进包"; exit 1; }
+
+          rm -rf /tmp/pkg && mkdir -p /tmp/pkg/Payload
+          cp -R "$APP" /tmp/pkg/Payload/
+          rm -rf /tmp/pkg/Payload/*.app/_CodeSignature /tmp/pkg/Payload/*.app/PlugIns/*/_CodeSignature 2>/dev/null || true
+          find /tmp/pkg -name "__MACOSX" -prune -exec rm -rf {} + 2>/dev/null || true
+
+          # 302 自查：TrollStore 只认这一种结构
+          echo "==== 302 自查 ===="
+          PL=$(find /tmp/pkg -name Info.plist -maxdepth 3 | wc -l | tr -d ' ')
+          [ "$PL" = "1" ] && echo "  ✅ 正好一份 Info.plist" || { echo "::error::Info.plist 数量=$PL"; exit 1; }
+          APPIN=/tmp/pkg/Payload/$(basename "$APP")
+          [ -f "$APPIN/Info.plist" ] && echo "  ✅ Payload/xxx.app/Info.plist" || { echo "::error::结构不对"; exit 1; }
+          EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APPIN/Info.plist")
+          [ -f "$APPIN/$EXE" ] && echo "  ✅ 主程序与 plist 对得上：$EXE" || { echo "::error::主程序对不上"; exit 1; }
+          [ -f "$APPIN/splash.mp4" ] && echo "  ✅ ipa 里有启动视频" || { echo "::error::ipa 里没视频"; exit 1; }
+          [ -f "$APPIN/splashWide.mp4" ] && echo "  ✅ ipa 里有横版启动视频" || { echo "::error::ipa 里没横版视频"; exit 1; }
+
+          OUT="langshen-v26.0-unsigned.ipa"
+          cd /tmp/pkg && zip -qry "/tmp/$OUT" Payload
+          cp "/tmp/$OUT" "$GITHUB_WORKSPACE/$OUT"
+          ls -lh "$GITHUB_WORKSPACE/$OUT"
+          echo "302 自查通过"
+
+      - name: 7 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: langshen-v26.0-ipa
+          path: langshen-v26.0-unsigned.ipa
+          if-no-files-found: error
+
+      - name: 8 出错时补打一遍日志结尾
+        if: failure()
+        run: |
+          echo "==== error 行 ===="
+          grep -E "error: " /tmp/build.log | sort -u | head -30 || echo "（没有 error 行）"
+          echo "==== 结尾 60 行 ===="
+          tail -60 /tmp/build.log || true
+
+      - name: 9 出错时把错误清单传上来
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v26-编译错误
+          path: v26-编译错误.txt
+          if-no-files-found: ignore
